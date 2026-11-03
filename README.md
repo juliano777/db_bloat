@@ -45,7 +45,7 @@ practice monitoring and cleanup with `pgstattuple`, `VACUUM`, `REINDEX`,
 ## Quick start
 
 ```bash
-git clone https://github.com/<your-user>/db_bloat.git
+git clone https://github.com/juliano777/db_bloat.git
 cd db_bloat
 psql -f db_bloat.sql
 ```
