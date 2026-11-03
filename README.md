@@ -2,8 +2,8 @@
 
 A small PostgreSQL toolkit to build a lab database full of **table and index
 bloat**, with a **different amount of bloat in each table**. Use it to
-practice monitoring and cleanup with `pgstattuple`, `VACUUM`, `REINDEX`,
-`pg_repack` and friends.
+practice monitoring and cleanup with `VACUUM`, `REINDEX`, `pg_repack` and
+friends.
 
 > **Lab use only.** The scripts generate a lot of data and WAL. Never run
 > them against a production database.
@@ -34,8 +34,9 @@ practice monitoring and cleanup with `pgstattuple`, `VACUUM`, `REINDEX`,
 ## Requirements
 
 - PostgreSQL 11 or later (procedures that `COMMIT` inside).
-- The `pgstattuple` extension (part of `contrib`) for the verification
-  step. Creating it normally requires superuser privileges.
+- No extensions. The verification and ranking queries use only the system
+  catalogs and statistics views, so any role that can read the tables is
+  enough.
 - Disk space, roughly:
   - ~150 MB per table with 1M rows (data plus 3 indexes), so ~15 GB for the
     default 100 tables.
@@ -123,33 +124,29 @@ Notes:
 
 ## Verify the result
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pgstattuple;
+Compare the target of each table with the share of dead tuples that
+PostgreSQL itself counts. No extension is needed:
 
+```sql
 SELECT p.table_name,
        p.target_ratio,
-       round((s.dead_tuple_percent / 100)::numeric, 4) AS actual_dead_ratio,
-       round((s.free_percent / 100)::numeric, 4)       AS free_ratio,
-       pg_size_pretty(s.table_len)                     AS table_size
+       round(s.n_dead_tup::numeric
+             / nullif(s.n_live_tup + s.n_dead_tup, 0), 4)
+                                       AS actual_dead_ratio,
+       s.n_live_tup,
+       s.n_dead_tup
 FROM bloat_plan p
-CROSS JOIN LATERAL
-     pgstattuple(('public.' || quote_ident(p.table_name))::regclass) s
+JOIN pg_stat_user_tables s ON s.schemaname = 'public'
+                          AND s.relname = p.table_name
 ORDER BY p.target_ratio;
 ```
 
-`pgstattuple` computes percentages over table bytes, so `actual_dead_ratio`
-usually lands a little below the target while keeping the same ordering and
-spread. This query reads every table in full, so it takes a while with 100
-tables. Limit it with a `WHERE` clause for a quick check.
+The counters come from the statistics system and count tuples, so
+`actual_dead_ratio` should land very close to `target_ratio`. They are
+updated asynchronously, so wait a few seconds after the `CALL`. A statistics
+reset or a crash zeroes them.
 
-To inspect index bloat, look at one index at a time. A low
-`avg_leaf_density` means a bloated index:
-
-```sql
-SELECT * FROM pgstatindex('tb_bloat_001_customer_id_idx');
-```
-
-For a quick overview from the statistics views:
+For a quick overview of the tables with the most dead tuples:
 
 ```sql
 SELECT relname, n_live_tup, n_dead_tup
@@ -160,106 +157,181 @@ LIMIT 15;
 
 ## Finding the most bloated objects
 
-The two queries below rank tables and indexes by bloat. Both use CTEs
-instead of subqueries, return every size in **bytes** (no "pretty"
-formatting) and sort by `bloat_size` and then `total_size`, both
-descending. Add a `LIMIT` to see only the top of the list.
+The two queries below rank tables and indexes by **estimated** bloat in
+bytes. They use only the system catalogs and the planner statistics, so no
+extension is required. Both use CTEs instead of subqueries, return every
+size in **bytes** (no "pretty" formatting) and sort by `bloat_size` and then
+`total_size`, both descending. Add a `LIMIT` to see only the top of the
+list.
 
-They need the `pgstattuple` extension and a role allowed to use it (a
-superuser or a member of `pg_stat_scan_tables`).
+How the estimate works: from the live row count (`reltuples`) and the
+average column widths in `pg_stats`, the queries work out how many pages the
+relation would need if it had no bloat, and call everything beyond that
+bloat. Therefore:
+
+- Run `ANALYZE` first. Relations that have not been analyzed are skipped.
+- `pg_stats` only shows columns the current role can read.
+- It is an estimate. It ignores column alignment padding, so a freshly
+  loaded table can show a few percent of bloat. In tests it ranked the
+  tables in the same order as exact measurements.
 
 ### Most bloated tables
 
 ```sql
-WITH tables AS (
-    SELECT c.oid        AS table_oid,
-           n.nspname    AS schema_name,
-           c.relname    AS table_name
+WITH settings AS (
+    SELECT current_setting('block_size')::int AS block_size,
+           24                                 AS page_header,
+           8                                  AS max_align
+),
+table_columns AS (
+    SELECT s.schemaname,
+           s.tablename,
+           count(*)                                      AS ncols,
+           sum((1 - s.null_frac::float8) * s.avg_width)  AS data_width,
+           max(s.null_frac)                              AS max_null_frac
+    FROM pg_stats s
+    WHERE NOT s.inherited
+    GROUP BY s.schemaname, s.tablename
+),
+tables AS (
+    SELECT n.nspname                AS schema_name,
+           c.relname                AS table_name,
+           c.reltuples,
+           pg_relation_size(c.oid)  AS total_size,
+           COALESCE(substring(array_to_string(c.reloptions, ',')
+                              FROM 'fillfactor=(\d+)')::int, 100)
+                                    AS fillfactor,
+           tc.ncols,
+           tc.data_width,
+           tc.max_null_frac
     FROM pg_class c
-    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_namespace n   ON n.oid = c.relnamespace
+    JOIN table_columns tc ON tc.schemaname = n.nspname
+                         AND tc.tablename = c.relname
     WHERE c.relkind IN ('r', 'm')
       AND c.relpersistence <> 't'
+      AND c.reltuples > 0
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND n.nspname !~ '^pg_toast'
 ),
-stats AS (
+estimates AS (
     SELECT t.schema_name,
            t.table_name,
-           s.table_len                               AS total_size,
-           s.dead_tuple_len + s.approx_free_space    AS bloat_size
+           t.total_size,
+           st.block_size,
+           ceil(t.reltuples / floor(
+               (st.block_size - st.page_header) * t.fillfactor / 100.0
+               / (4
+                  + ceil((23 + CASE WHEN t.max_null_frac > 0
+                                    THEN ceil(t.ncols / 8.0) ELSE 0 END)
+                         / st.max_align) * st.max_align
+                  + ceil(t.data_width / st.max_align) * st.max_align)
+           )) AS expected_pages
     FROM tables t
-    CROSS JOIN LATERAL pgstattuple_approx(t.table_oid) s
+    CROSS JOIN settings st
 )
-SELECT schema_name, table_name, total_size, bloat_size
-FROM stats
+SELECT schema_name,
+       table_name,
+       total_size,
+       (greatest(0, total_size / block_size - expected_pages)
+        * block_size)::bigint AS bloat_size
+FROM estimates
 ORDER BY bloat_size DESC, total_size DESC;
 ```
 
 - `total_size` is the size of the table's main fork. Indexes and TOAST are
   not included.
-- `bloat_size` is the space taken by dead tuples plus the free space inside
-  the pages, as reported by `pgstattuple_approx`.
-- `pgstattuple_approx` skips pages that are all-visible, so it is much
-  faster than `pgstattuple` and still accurate here, because the pages with
-  dead tuples are not all-visible. For exact numbers, call
-  `pgstattuple(t.table_oid)` and use `s.free_space` instead of
-  `s.approx_free_space`.
+- `bloat_size` is the space occupied by pages beyond the expected number.
+  The expected size counts, per row, the 4-byte line pointer, the tuple
+  header (23 bytes plus a null bitmap when the table has nullable data),
+  the column data, 8-byte alignment, and the table fillfactor.
 - Partitioned parents are not listed, but their partitions are.
 
 ### Most bloated indexes
 
 ```sql
-WITH indexes AS (
-    SELECT ic.oid       AS index_oid,
-           n.nspname    AS schema_name,
-           t.relname    AS table_name,
-           ic.relname   AS index_name,
+WITH settings AS (
+    SELECT current_setting('block_size')::int AS block_size,
+           24                                 AS page_header,
+           16                                 AS special_space,
+           8                                  AS max_align
+),
+indexes AS (
+    SELECT n.nspname                  AS schema_name,
+           t.relname                  AS table_name,
+           ic.relname                 AS index_name,
+           ic.reltuples,
+           pg_relation_size(ic.oid)   AS total_size,
            COALESCE(substring(array_to_string(ic.reloptions, ',')
-                              FROM 'fillfactor=(\d+)')::float8, 90)
-                        AS fillfactor
+                              FROM 'fillfactor=(\d+)')::int, 90)
+                                      AS fillfactor,
+           count(*)                   AS ncols,
+           sum((1 - COALESCE(s.null_frac, 0)::float8)
+               * COALESCE(s.avg_width, 0))
+                                      AS data_width,
+           max(s.null_frac)           AS max_null_frac
     FROM pg_index i
-    JOIN pg_class ic    ON ic.oid = i.indexrelid
-    JOIN pg_class t     ON t.oid = i.indrelid
-    JOIN pg_namespace n ON n.oid = t.relnamespace
-    JOIN pg_am am       ON am.oid = ic.relam
+    JOIN pg_class ic     ON ic.oid = i.indexrelid
+    JOIN pg_class t      ON t.oid = i.indrelid
+    JOIN pg_namespace n  ON n.oid = t.relnamespace
+    JOIN pg_am am        ON am.oid = ic.relam
+    JOIN pg_attribute a  ON a.attrelid = ic.oid AND a.attnum > 0
+    LEFT JOIN pg_stats s ON s.schemaname = n.nspname
+                        AND s.attname = a.attname
+                        AND NOT s.inherited
+                        AND s.tablename = CASE WHEN i.indkey[a.attnum - 1] > 0
+                                               THEN t.relname
+                                               ELSE ic.relname END
     WHERE am.amname = 'btree'
       AND ic.relkind = 'i'
       AND ic.relpersistence <> 't'
       AND i.indisvalid
+      AND ic.reltuples > 0
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
       AND n.nspname !~ '^pg_toast'
+    GROUP BY n.nspname, t.relname, ic.relname, ic.oid,
+             ic.reltuples, ic.reloptions
+    HAVING count(s.attname) = count(*)
 ),
-stats AS (
+estimates AS (
     SELECT x.schema_name,
            x.table_name,
            x.index_name,
-           s.index_size AS total_size,
-           COALESCE(NULLIF(s.avg_leaf_density, 'NaN'), x.fillfactor)
-                        AS leaf_density,
-           x.fillfactor
+           x.total_size,
+           st.block_size,
+           1 + ceil(x.reltuples / floor(
+               (st.block_size - st.page_header - st.special_space)
+               * x.fillfactor / 100.0
+               / (4
+                  + ceil((8 + CASE WHEN x.max_null_frac > 0
+                                   THEN ceil(x.ncols / 8.0) ELSE 0 END)
+                         / st.max_align) * st.max_align
+                  + ceil(x.data_width / st.max_align) * st.max_align)
+           )) AS expected_pages
     FROM indexes x
-    CROSS JOIN LATERAL pgstatindex(x.index_oid) s
+    CROSS JOIN settings st
 )
 SELECT schema_name,
        table_name,
        index_name,
        total_size,
-       round(total_size * greatest(0, 1 - leaf_density / fillfactor))::bigint
-           AS bloat_size
-FROM stats
+       (greatest(0, total_size / block_size - expected_pages)
+        * block_size)::bigint AS bloat_size
+FROM estimates
 ORDER BY bloat_size DESC, total_size DESC;
 ```
 
-- Only B-tree indexes are listed, because `pgstatindex` supports only
-  those. Invalid and temporary indexes are skipped.
+- Only B-tree indexes are listed. Invalid and temporary indexes are
+  skipped, and so are indexes with a column that has no statistics yet.
 - `total_size` is the size of the index.
-- `bloat_size` is an **estimate**: the share of the index that is empty
-  beyond its fillfactor, calculated as
-  `index_size * (1 - avg_leaf_density / fillfactor)`, never below zero.
-  The fillfactor comes from the index options and defaults to 90, so a
-  freshly built index shows no bloat.
-- Empty indexes have no leaf density (`NaN`) and are counted as having no
-  bloat.
+- `bloat_size` is the space occupied by pages beyond the expected number
+  for a freshly built index with the same entries. The expected size counts
+  the metapage, the 4-byte line pointer, the 8-byte index tuple header, the
+  column data, 8-byte alignment, and the index fillfactor (default 90).
+  Columns of expression indexes use the statistics stored under the index
+  name.
+- The upper levels of the B-tree (about 1% of the index) are not counted,
+  so the estimate can be slightly high.
 
 ## Cleaning up the bloat
 
